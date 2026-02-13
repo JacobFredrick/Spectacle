@@ -20,6 +20,36 @@ LINK_TIMEOUT_SECONDS = 5.0     # seconds before an unscored ball-robot link expi
 ROBOT_BOX_COLOR = (255, 150, 0)  # blue-ish BGR for robot outlines
 LINK_LINE_COLOR = (0, 165, 255)  # orange BGR for ball-robot link lines
 
+# Adaptive robot tracking constants
+REINIT_INTERVAL = 90             # re-init tracker every N frames to refresh appearance
+RECOVERY_SEARCH_EXPAND = 2.0    # expand search area by this factor when recovering
+RECOVERY_MATCH_THRESHOLD = 0.5  # template matching confidence for auto-recovery
+RECOVERY_COOLDOWN = 10          # only attempt recovery every N frames
+ROBOT_YOLO_CLASS = None          # set to a YOLO class ID to enable YOLO-based re-detection
+LOST_WARNING_SECONDS = 3.0      # show recalibrate warning after robot lost this long
+
+# Path to VIT tracker model (relative to script directory)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+VIT_MODEL_PATH = os.path.join(_SCRIPT_DIR, "vitTracker.onnx")
+
+
+def _create_robot_tracker():
+    """Create the best available OpenCV tracker, with fallback chain:
+    TrackerVit (best) > TrackerCSRT > TrackerMIL (always available)."""
+    # Try VIT first (Vision Transformer — best for rotation/appearance changes)
+    if hasattr(cv2, 'TrackerVit') and os.path.isfile(VIT_MODEL_PATH):
+        try:
+            params = cv2.TrackerVit_Params()
+            params.net = VIT_MODEL_PATH
+            return cv2.TrackerVit.create(params)
+        except cv2.error:
+            pass
+    # Try CSRT (needs opencv-contrib-python)
+    if hasattr(cv2, 'TrackerCSRT'):
+        return cv2.TrackerCSRT.create()
+    # Fallback to MIL (always available)
+    return cv2.TrackerMIL.create()
+
 
 def _create_kalman(cx, cy, pn_h=1, pn_v=100, meas_n=25):
     """Create a Kalman filter for tracking position, velocity, and acceleration
@@ -53,7 +83,8 @@ class KalmanMOTracker:
     based on distance to the Kalman-predicted position, not last-seen position."""
 
     def __init__(self, max_disappeared=30, gate_distance=200,
-                 pn_h=1, pn_v=100, meas_n=25):
+                 pn_h=1, pn_v=100, meas_n=25,
+                 use_time=False, disappear_seconds=5.0):
         self.next_id = 0
         self.tracks = OrderedDict()
         self.gate_distance = gate_distance
@@ -61,6 +92,8 @@ class KalmanMOTracker:
         self.pn_h = pn_h
         self.pn_v = pn_v
         self.meas_n = meas_n
+        self.use_time = use_time
+        self.disappear_seconds = disappear_seconds
 
     def update_noise(self, pn_h, pn_v, meas_n):
         """Live-update Kalman noise matrices on all active tracks."""
@@ -79,6 +112,7 @@ class KalmanMOTracker:
                                  self.pn_h, self.pn_v, self.meas_n),
             "bbox": bbox,
             "disappeared": 0,
+            "disappeared_since": None,
             "predicted": (float(cx), float(cy)),
         }
         self.next_id += 1
@@ -86,9 +120,17 @@ class KalmanMOTracker:
     def _deregister(self, oid):
         del self.tracks[oid]
 
-    def update(self, detections):
+    def _should_deregister(self, oid, current_time):
+        """Check if a track should be deregistered based on mode."""
+        if self.use_time and current_time is not None:
+            since = self.tracks[oid]["disappeared_since"]
+            return since is not None and (current_time - since) > self.disappear_seconds
+        return self.tracks[oid]["disappeared"] > self.max_disappeared
+
+    def update(self, detections, current_time=None):
         """Update with new detections: list of (cx, cy, x, y, w, h).
-        Returns dict of id -> (cx, cy, px, py, x, y, w, h)."""
+        Returns dict of id -> (cx, cy, px, py, x, y, w, h).
+        current_time: pass time.time() for camera mode (time-based disappearance)."""
 
         for oid, trk in self.tracks.items():
             pred = trk["kf"].predict()
@@ -97,7 +139,9 @@ class KalmanMOTracker:
         if len(detections) == 0:
             for oid in list(self.tracks.keys()):
                 self.tracks[oid]["disappeared"] += 1
-                if self.tracks[oid]["disappeared"] > self.max_disappeared:
+                if self.tracks[oid]["disappeared_since"] is None:
+                    self.tracks[oid]["disappeared_since"] = current_time
+                if self._should_deregister(oid, current_time):
                     self._deregister(oid)
             return self._build_result()
 
@@ -134,13 +178,16 @@ class KalmanMOTracker:
             self.tracks[oid]["kf"].correct(measurement)
             self.tracks[oid]["bbox"] = input_bboxes[col]
             self.tracks[oid]["disappeared"] = 0
+            self.tracks[oid]["disappeared_since"] = None
             used_rows.add(row)
             used_cols.add(col)
 
         for row in set(range(len(track_ids))) - used_rows:
             oid = track_ids[row]
             self.tracks[oid]["disappeared"] += 1
-            if self.tracks[oid]["disappeared"] > self.max_disappeared:
+            if self.tracks[oid]["disappeared_since"] is None:
+                self.tracks[oid]["disappeared_since"] = current_time
+            if self._should_deregister(oid, current_time):
                 self._deregister(oid)
 
         for col in set(range(len(input_centroids))) - used_cols:
@@ -240,8 +287,68 @@ def detect_yolo(frame, model, conf=CONF_THRESHOLD):
     return detections
 
 
+def _try_recover_robot(frame, robot, model=None):
+    """Try to recover a lost robot using template matching, then optionally YOLO.
+    Updates robot['bbox'] in-place and returns True if recovered."""
+    last_crop = robot.get("last_good_crop")
+    last_bbox = robot.get("last_known_bbox")
+    if last_crop is None or last_bbox is None:
+        return False
+
+    rx, ry, rw, rh = last_bbox
+    fh, fw = frame.shape[:2]
+
+    # Define expanded search region around last known position
+    expand_w = int(rw * RECOVERY_SEARCH_EXPAND)
+    expand_h = int(rh * RECOVERY_SEARCH_EXPAND)
+    sx = max(0, rx - expand_w)
+    sy = max(0, ry - expand_h)
+    sw = min(fw - sx, rw + 2 * expand_w)
+    sh = min(fh - sy, rh + 2 * expand_h)
+
+    search_region = frame[sy:sy + sh, sx:sx + sw]
+    template = last_crop
+
+    # Template must be smaller than the search region
+    if (template.shape[0] < search_region.shape[0] and
+            template.shape[1] < search_region.shape[1] and
+            template.shape[0] > 0 and template.shape[1] > 0):
+        result = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+        if max_val >= RECOVERY_MATCH_THRESHOLD:
+            mx, my = max_loc
+            new_bbox = (sx + mx, sy + my, template.shape[1], template.shape[0])
+            robot["bbox"] = new_bbox
+            robot["last_known_bbox"] = new_bbox
+            return True
+
+    # Optionally try YOLO-based re-detection
+    if model is not None and ROBOT_YOLO_CLASS is not None:
+        results = model(frame, classes=[ROBOT_YOLO_CLASS], conf=0.3, verbose=False)
+        best_dist = float('inf')
+        best_bbox = None
+        last_cx = rx + rw // 2
+        last_cy = ry + rh // 2
+        for box in results[0].boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            det_cx = (x1 + x2) // 2
+            det_cy = (y1 + y2) // 2
+            dist = ((det_cx - last_cx) ** 2 + (det_cy - last_cy) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_bbox = (x1, y1, x2 - x1, y2 - y1)
+        if best_bbox is not None and best_dist < max(rw, rh) * RECOVERY_SEARCH_EXPAND:
+            robot["bbox"] = best_bbox
+            robot["last_known_bbox"] = best_bbox
+            return True
+
+    return False
+
+
 def select_video_source():
-    """Prompt the user to choose a video source."""
+    """Prompt the user to choose a video source.
+    Returns (cap, is_camera) where is_camera is True for webcam."""
     print("\n=== Select Video Source ===")
     print("1. Webcam (default camera)")
     print("2. Local video file")
@@ -249,14 +356,14 @@ def select_video_source():
     choice = input("Enter choice (1/2/3): ").strip()
 
     if choice == "1":
-        return cv2.VideoCapture(0)
+        return cv2.VideoCapture(0), True
     elif choice == "2":
         path = input("Enter path to video file: ").strip().strip('"')
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             print(f"Error: Could not open video file '{path}'.")
             sys.exit(1)
-        return cap
+        return cap, False
     elif choice == "3":
         url = input("Enter YouTube URL: ").strip()
         print("Downloading video with yt-dlp, please wait...")
@@ -286,10 +393,10 @@ def select_video_source():
             print("Error: Could not open downloaded video.")
             sys.exit(1)
         print("Download complete. Starting detector...")
-        return cap
+        return cap, False
     else:
         print("Invalid choice. Using webcam.")
-        return cv2.VideoCapture(0)
+        return cv2.VideoCapture(0), True
 
 
 def main():
@@ -298,7 +405,7 @@ def main():
     model = YOLO("yolo26n.pt")
     print("Model loaded.")
 
-    cap = select_video_source()
+    cap, is_camera = select_video_source()
 
     ret, frame = cap.read()
     if not ret:
@@ -341,15 +448,28 @@ def main():
         name = input(f"  Enter team number/name for robot {i+1}: ").strip()
         if not name:
             name = f"Robot{i+1}"
-        tracker = cv2.TrackerMIL.create()
-        tracker.init(frame, tuple(int(v) for v in robot_roi))
+        tracker = _create_robot_tracker()
+        roi_tuple = tuple(int(v) for v in robot_roi)
+        tracker.init(frame, roi_tuple)
+        rx, ry, rw, rh = roi_tuple
+        fh, fw = frame.shape[:2]
+        cx1, cy1 = max(0, rx), max(0, ry)
+        cx2, cy2 = min(fw, rx + rw), min(fh, ry + rh)
+        initial_crop = frame[cy1:cy2, cx1:cx2].copy() if cx2 > cx1 and cy2 > cy1 else None
         robots[i] = {
             "name": name,
             "tracker": tracker,
-            "bbox": tuple(int(v) for v in robot_roi),
+            "bbox": roi_tuple,
+            "initial_size": (roi_tuple[2], roi_tuple[3]),
             "ok": True,
             "red_score": 0,
             "blue_score": 0,
+            "last_good_crop": initial_crop,
+            "last_known_bbox": roi_tuple,
+            "frames_since_reinit": 0,
+            "recovery_counter": 0,
+            "lost_since": None,
+            "lost_warned": False,
         }
         print(f"  Registered: {name}")
 
@@ -366,7 +486,7 @@ def main():
     cv2.createTrackbar("Kernel Size",  CTRL_WIN, 3,    31,   noop)
     # Tracking
     cv2.createTrackbar("Gate Dist",    CTRL_WIN, 30,  5000,  noop)
-    cv2.createTrackbar("Max Disappear",CTRL_WIN, 30,   120,  noop)
+    cv2.createTrackbar("Max Disappear",CTRL_WIN, 30,   500,  noop)
     # Kalman noise
     cv2.createTrackbar("PN Horiz",     CTRL_WIN, 1,    200,  noop)
     cv2.createTrackbar("PN Vert",      CTRL_WIN, 100,  200,  noop)
@@ -374,8 +494,22 @@ def main():
     # Playback
     cv2.createTrackbar("Speed Factor", CTRL_WIN, 1250, 5000, noop)
 
+    # Video FPS for playback speed and disappearance calculation
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not video_fps or video_fps <= 0:
+        video_fps = 30
+
     # Kalman MOT tracker for persistent object IDs with motion prediction
-    ct = KalmanMOTracker(max_disappeared=30)
+    # Camera mode: use wall-clock time (5 seconds real time)
+    # Video mode: use frame count (5 seconds of video time = 5 * fps frames)
+    if is_camera:
+        disappear_frames = int(5 * 30)  # fallback frame count
+        ct = KalmanMOTracker(max_disappeared=disappear_frames,
+                             use_time=True, disappear_seconds=5.0)
+    else:
+        disappear_frames = int(5 * video_fps)
+        ct = KalmanMOTracker(max_disappeared=disappear_frames)
+    cv2.setTrackbarPos("Max Disappear", CTRL_WIN, disappear_frames)
 
     # Detection modes
     yolo_enabled = True
@@ -398,11 +532,6 @@ def main():
     print("3 - Re-initialize robot trackers")
     print("=========================")
     print("Use the Controls window sliders to tune parameters in real time.\n")
-
-    # Video FPS for playback speed calculation
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
-    if not video_fps or video_fps <= 0:
-        video_fps = 30
 
     while True:
         ret, frame = cap.read()
@@ -428,11 +557,65 @@ def main():
         ct.update_noise(pn_h, pn_v, meas_n)
 
         # --- Update robot trackers ---
+        fh_r, fw_r = frame.shape[:2]
         for idx, robot in robots.items():
             ok, new_bbox = robot["tracker"].update(frame)
-            robot["ok"] = ok
             if ok:
-                robot["bbox"] = tuple(int(v) for v in new_bbox)
+                # Lock bbox to initial size — keep the tracker's center,
+                # but force width/height to the original selection
+                tx, ty, tw, th = (int(v) for v in new_bbox)
+                iw, ih = robot["initial_size"]
+                center_x = tx + tw // 2
+                center_y = ty + th // 2
+                locked_x = center_x - iw // 2
+                locked_y = center_y - ih // 2
+
+                # Reject if center is outside the frame (robot left view)
+                if not (0 <= center_x < fw_r and 0 <= center_y < fh_r):
+                    ok = False
+
+            if ok:
+                robot["ok"] = True
+                robot["bbox"] = (locked_x, locked_y, iw, ih)
+                robot["frames_since_reinit"] += 1
+                robot["recovery_counter"] = 0
+                robot["lost_since"] = None
+                robot["lost_warned"] = False
+                # Save last good crop for recovery (clipped to frame)
+                cx1, cy1 = max(0, locked_x), max(0, locked_y)
+                cx2, cy2 = min(fw_r, locked_x + iw), min(fh_r, locked_y + ih)
+                if cx2 > cx1 and cy2 > cy1:
+                    robot["last_good_crop"] = frame[cy1:cy2, cx1:cx2].copy()
+                    robot["last_known_bbox"] = robot["bbox"]
+                # Periodic re-init to refresh appearance model
+                if robot["frames_since_reinit"] >= REINIT_INTERVAL:
+                    robot["tracker"] = _create_robot_tracker()
+                    robot["tracker"].init(frame, robot["bbox"])
+                    robot["frames_since_reinit"] = 0
+            else:
+                # Mark lost and track how long
+                robot["ok"] = False
+                if robot["lost_since"] is None:
+                    robot["lost_since"] = time.time()
+                # Console warning once per loss event
+                if not robot["lost_warned"] and robot["lost_since"] is not None:
+                    elapsed = time.time() - robot["lost_since"]
+                    if elapsed >= LOST_WARNING_SECONDS:
+                        print(f"  WARNING: {robot['name']} lost for "
+                              f"{elapsed:.1f}s — press 3 to recalibrate")
+                        robot["lost_warned"] = True
+                # Attempt auto-recovery
+                robot["recovery_counter"] += 1
+                if robot["recovery_counter"] % RECOVERY_COOLDOWN == 1:
+                    yolo_model = model if ROBOT_YOLO_CLASS is not None else None
+                    if _try_recover_robot(frame, robot, yolo_model):
+                        robot["tracker"] = _create_robot_tracker()
+                        robot["tracker"].init(frame, robot["bbox"])
+                        robot["ok"] = True
+                        robot["frames_since_reinit"] = 0
+                        robot["recovery_counter"] = 0
+                        robot["lost_since"] = None
+                        robot["lost_warned"] = False
 
         # Detect objects from all active sources
         all_detections = []
@@ -441,7 +624,7 @@ def main():
         for hsv_lower, hsv_upper in color_targets:
             all_detections.extend(detect_hsv(frame, hsv_lower, hsv_upper,
                                              min_area, kernel_sz))
-        tracked = ct.update(all_detections)
+        tracked = ct.update(all_detections, current_time=time.time())
 
         # Zone coordinates
         rz_x, rz_y, rz_w, rz_h = [int(v) for v in red_zone]
@@ -601,12 +784,40 @@ def main():
         # --- Draw robots ---
         for idx, robot in robots.items():
             if not robot["ok"]:
+                # Draw last known position with dashed-style outline
+                if robot["last_known_bbox"] is not None:
+                    rx, ry, rw, rh = robot["last_known_bbox"]
+                    cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh),
+                                  (0, 0, 255), 1)
+                    cv2.putText(frame, f"{robot['name']} LOST",
+                                (rx, ry - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6, (0, 0, 255), 2)
                 continue
             rx, ry, rw, rh = robot["bbox"]
             cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh),
                           ROBOT_BOX_COLOR, 2)
             cv2.putText(frame, robot["name"], (rx, ry - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, ROBOT_BOX_COLOR, 2)
+
+        # --- Recalibration warning banner ---
+        lost_names = [r["name"] for r in robots.values()
+                      if not r["ok"] and r["lost_since"] is not None
+                      and (time.time() - r["lost_since"]) >= LOST_WARNING_SECONDS]
+        if lost_names:
+            # Flash by toggling visibility every ~0.5s
+            flash_on = int(time.time() * 2) % 2 == 0
+            if flash_on:
+                warn_text = f"RECALIBRATE (3): {', '.join(lost_names)}"
+                tw = cv2.getTextSize(warn_text, cv2.FONT_HERSHEY_SIMPLEX,
+                                     0.8, 2)[0][0]
+                banner_x = (frame.shape[1] - tw) // 2
+                banner_y = frame.shape[0] - 30
+                # Dark background for readability
+                cv2.rectangle(frame, (banner_x - 10, banner_y - 30),
+                              (banner_x + tw + 10, banner_y + 10),
+                              (0, 0, 0), -1)
+                cv2.putText(frame, warn_text, (banner_x, banner_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
         # --- Per-robot scoring HUD (right side) ---
         if robots:
@@ -642,7 +853,8 @@ def main():
             # Undo last color target
             if color_targets:
                 color_targets.pop()
-                ct = KalmanMOTracker(max_disappeared=30)
+                ct = KalmanMOTracker(max_disappeared=disappear_frames,
+                                     use_time=is_camera, disappear_seconds=5.0)
                 was_inside_red.clear()
                 was_inside_blue.clear()
                 print(f"Removed last color target. {len(color_targets)} remaining.")
@@ -651,13 +863,15 @@ def main():
         elif key == ord("y"):
             # Toggle YOLO on/off
             yolo_enabled = not yolo_enabled
-            ct = KalmanMOTracker(max_disappeared=30)
+            ct = KalmanMOTracker(max_disappeared=disappear_frames,
+                                 use_time=is_camera, disappear_seconds=5.0)
             was_inside_red.clear()
             was_inside_blue.clear()
             print(f"YOLO {'enabled' if yolo_enabled else 'disabled'}")
         elif key == ord("r"):
             # Reset tracker, color targets, and robot scores
-            ct = KalmanMOTracker(max_disappeared=30)
+            ct = KalmanMOTracker(max_disappeared=disappear_frames,
+                                 use_time=is_camera, disappear_seconds=5.0)
             color_targets.clear()
             was_inside_red.clear()
             was_inside_blue.clear()
@@ -668,6 +882,8 @@ def main():
             for robot in robots.values():
                 robot["red_score"] = 0
                 robot["blue_score"] = 0
+                robot["lost_since"] = None
+                robot["lost_warned"] = False
             print("Tracker, color targets, and robot scores reset.")
         elif key == ord("1"):
             # Re-draw RED zone
@@ -691,11 +907,23 @@ def main():
                                          fromCenter=False,
                                          showCrosshair=True)
                 if new_roi != (0, 0, 0, 0):
-                    robot["tracker"] = cv2.TrackerMIL.create()
-                    robot["tracker"].init(frame,
-                                          tuple(int(v) for v in new_roi))
-                    robot["bbox"] = tuple(int(v) for v in new_roi)
+                    roi_tuple = tuple(int(v) for v in new_roi)
+                    robot["tracker"] = _create_robot_tracker()
+                    robot["tracker"].init(frame, roi_tuple)
+                    robot["bbox"] = roi_tuple
+                    robot["initial_size"] = (roi_tuple[2], roi_tuple[3])
                     robot["ok"] = True
+                    robot["frames_since_reinit"] = 0
+                    robot["recovery_counter"] = 0
+                    robot["lost_since"] = None
+                    robot["lost_warned"] = False
+                    robot["last_known_bbox"] = roi_tuple
+                    rx, ry, rw, rh = roi_tuple
+                    fh_r, fw_r = frame.shape[:2]
+                    cx1, cy1 = max(0, rx), max(0, ry)
+                    cx2, cy2 = min(fw_r, rx + rw), min(fh_r, ry + rh)
+                    if cx2 > cx1 and cy2 > cy1:
+                        robot["last_good_crop"] = frame[cy1:cy2, cx1:cx2].copy()
                     print(f"  Re-initialized {robot['name']}")
             ball_links.clear()
             ball_near_robot.clear()
