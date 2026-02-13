@@ -2,6 +2,8 @@ Spectacle is a FRC bot tracking program developed by team 5137, made specifcally
 
 Info: Clone the repository in git hub, the program can run using the standard Windows 11 camera or a downloaded video, run the program then follow the listed steps in the terminal, the program is very resource intensive.
 
+Releases can be found [here](https://github.com/JacobFredrick/Spectacle/releases)
+
 References:
 
 https://github.com/ultralytics/ultralytics?tab=readme-ov-file
